@@ -37,6 +37,43 @@ import com.xemantic.ai.claudine.tool.ReadFiles
 import com.xemantic.ai.claudine.tool.describeTools
 import io.ktor.client.HttpClient
 
+/**
+ * Minimum token count required for prompt caching to be effective.
+ * Below this threshold, caching costs more than it saves.
+ */
+private const val MIN_CACHEABLE_TOKENS = 1024
+
+/**
+ * Adds a cache breakpoint to the last message in the conversation with the specified TTL,
+ * but only if the conversation is large enough to benefit from caching.
+ */
+private fun List<Message>.addCacheBreakpointIfWorthwhile(
+    conversationTokens: Int,
+    ttl: CacheControl.Ephemeral.TTL = CacheControl.Ephemeral.TTL.ONE_HOUR
+): List<Message> {
+    return if (conversationTokens >= MIN_CACHEABLE_TOKENS) {
+        mapLast { message ->
+            message.copy {
+                content = content.mapLast { contentElement ->
+                    contentElement.alterCacheControl(
+                        CacheControl.Ephemeral { this.ttl = ttl }
+                    )
+                }
+            }
+        }
+    } else {
+        this // Don't add cache breakpoint if conversation is too small
+    }
+}
+
+/**
+ * Helper extension to transform the last element of a list.
+ */
+private inline fun <T> List<T>.mapLast(transform: (T) -> T): List<T> {
+    return if (isEmpty()) this
+    else dropLast(1) + transform(last())
+}
+
 val claudineSystemPrompt = """
 Your name is Claudine and you are an AI agent controlling the machine of the human you are connected to while using cognition of the Claude AI LLM model.
 
@@ -96,14 +133,18 @@ suspend fun claudine(): Int {
 
     var totalStats = CostWithUsage.ZERO
     val conversation = mutableListOf<Message>()
+    var conversationTokens = 0 // Track conversation size for conditional caching
+
     val systemPrompt = listOf(
         System(
             text = """
                 $claudineSystemPrompt
-                
+
                 ${describeCurrentMoment()}
             """.trimIndent(),
-            cacheControl = CacheControl.Ephemeral()
+            cacheControl = CacheControl.Ephemeral {
+                ttl = CacheControl.Ephemeral.TTL.ONE_HOUR
+            }
         )
     )
 
@@ -133,7 +174,7 @@ suspend fun claudine(): Int {
             }
             val response = anthropic.messages.create {
                 system = systemPrompt
-                messages = conversation.addCacheBreakpoint()
+                messages = conversation.addCacheBreakpointIfWorthwhile(conversationTokens)
                 tools = toolbox.tools
             }
             if (response.stopReason == StopReason.MAX_TOKENS) {
@@ -145,6 +186,11 @@ suspend fun claudine(): Int {
             }
 
             conversation += response
+
+            // Update conversation token count for next turn
+            // Accumulate tokens to track total conversation size
+            // inputTokens represents non-cached input on this turn
+            conversationTokens += response.usage.inputTokens
 
             response.text?.run {
                 println("[Claudine]> ${response.text}")
